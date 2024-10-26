@@ -29,17 +29,17 @@ rc('text', usetex=True)
 # precompute function to get distances
 redshift_grid = np.logspace(-4, 0.5, 10000)
 comoving_distance_grid = cosmo.comoving_distance(redshift_grid).value
-#@njit
+@njit
 def comoving_distance_from_redshift(redshift):
     comoving_distance = np.interp(redshift, redshift_grid, comoving_distance_grid)
     return comoving_distance
-#@njit
+@njit
 def redshift_from_comoving_distance(comoving_distance):
     redshift = np.interp(comoving_distance, comoving_distance_grid, redshift_grid)
     return redshift
 
 # parameters of the simulation
-M = 5e5 * u.Msun # Msun
+M = 1e7 * u.Msun # Msun
 G1Mc2 = (c.G * (1 * u.Msun).to(u.kg) / c.c**2).to(u.Mpc).value
 M = M.value
 R_tube = 1e-3 # Mpc
@@ -73,58 +73,152 @@ z = distances
 # full vector of disruptors
 xdis = np.array([x, y, z])
 
-# Rauch Eq 4
-#@njit
-def xj(x, xdis, dj, M):
+# Rauch Eq 4 ish
+@njit
+def xj(x, xdis, Dj, M):
     GMc2 = M * G1Mc2
 
-    zj = redshift_from_comoving_distance(dj)
-    Dj = dj
+    zj = redshift_from_comoving_distance(Dj)
     D1 = x[2, 0]
 
-    # thing at the end of the sun
-    #diff = (x[0:2, :] - xdis[0:2, :]) / np.linalg.norm(x[0:2, :] - xdis[0:2, :], axis=0)**2
+    # thing at the end of the sum
     diff = (x[0:2, :] - xdis[0:2, :]) / ((x[0, :] - xdis[0, :])**2 + (x[1, :] - xdis[1, :])**2)
 
     # full equation
     ans = Dj * x[:2, 0] / D1 - 4 * GMc2 * np.sum((1 + zj) * (Dj - x[2, :]) * diff, axis=1)
     return ans
 
+# SEF Eq 9.10
+@njit
+def Ui(x, xdis, M):
+    # technically this is just \partial \alpha_i / \partial \xi_i
+    # i include the extra fractor of D_i in the summation in Aj()
+    mat = np.zeros((2, 2, x.shape[1]))
+
+    # values
+    GMc2 = M * G1Mc2
+    zi = redshift_from_comoving_distance(x[2, :])
+    norm2 = (x[0, :] - xdis[0, :])**2 + (x[1, :] - xdis[1, :])**2
+
+    # final equations from differentiating alpha (and cancelling the Dis/Ds factor)
+    # (1+z)^2 is from converting from angular diamter distances to comoving distances
+    mat[0, 0, :] = 4 * GMc2 * (1 + zi)**2 / norm2**2 * (norm2 - 2 * (x[0, :] - xdis[0, :])**2)
+    mat[1, 0, :] = 4 * GMc2 * (1 + zi)**2 / norm2**2 * (-2 * (x[0, :] - xdis[0, :]) * (x[1, :] - xdis[1, :]))
+    mat[0, 1, :] = 4 * GMc2 * (1 + zi)**2 / norm2**2 * (-2 * (x[0, :] - xdis[0, :]) * (x[1, :] - xdis[1, :]))
+    mat[1, 1, :] = 4 * GMc2 * (1 + zi)**2 / norm2**2 * (norm2 - 2 * (x[1, :] - xdis[1, :])**2)
+    return mat
+
+@njit
+def matmul(A, B):
+    out = np.zeros(A.shape)
+    out[0, 0, :] = A[0, 0, :] * B[0, 0, :] + A[0, 1, :] * B[1, 0, :]
+    out[0, 1, :] = A[0, 0, :] * B[0, 1, :] + A[0, 1, :] * B[1, 1, :]
+    out[1, 0, :] = A[1, 0, :] * B[0, 0, :] + A[1, 1, :] * B[1, 0, :]
+    out[1, 1, :] = A[1, 0, :] * B[0, 1, :] + A[1, 1, :] * B[1, 1, :]
+    return out
+
+# SEF Eq 9.12 ish
+@njit
+def Aj(x, Amat, xdis, Dj, M):
+    I = np.identity(2)
+    zj = redshift_from_comoving_distance(Dj)
+    Dfactor = (Dj - x[2, :]) / (1 + zj) * x[2, :] / Dj
+
+    # \partial \alpha_i / \partial \xi_i
+    Umat = Ui(x, xdis, M)
+    # calculate Aj from previous Ai
+    A = I - np.sum(Dfactor * matmul(Umat, Amat), axis=2)
+    return A
+
 # recursively finding source positions
-#@njit
-def compute_source_position(image_position, xdis, N_screens=None):
+@njit
+def compute_img_position_and_mag(image_position, xdis, N_screens=None):
     # choose between running through all screens or just some
     if N_screens == None:
         N = xdis.shape[1]
     else:
         N = N_screens
 
+    # instantiate empty arrays
+    ximg = np.zeros((3, N))
+    Amat = np.zeros((2, 2, N))
+    ximg[:, 0] = [image_position[0], image_position[1], xdis[2, 0]]
+
     # solve for all image positions, starting from the nearest plane to observer
-    image_position.append(xdis[2, 0])
-    ximg = np.array([image_position])
     for ii in range(1, N):
-        x = ximg.T
+        # shorten the arrays / get values
+        x = ximg[:, 0:ii]
         x_disruptors = xdis[:, 0:ii]
-        dj = xdis[2, ii]
-        xii = xj(x, x_disruptors, dj, M) 
-        #xii = xii.tolist()
-        #xii.append(float(dj))
-        xii = np.append(xii, dj)
-        ximg = np.append(ximg, xii).reshape(ii+1,3)
+        A = Amat[:, :, 0:ii]
+        Dj = xdis[2, ii]
 
-    return ximg.T
+        # calculate stuff
+        xi = xj(x, x_disruptors, Dj, M) 
+        Ai = Aj(x, A, x_disruptors, Dj, M)
 
-img_pos = compute_source_position([0.0,0.0], xdis, N_screens=None)
+        # save results
+        ximg[:, ii] = [xi[0], xi[1], Dj]
+        Amat[:, :, ii] = Ai
 
-x = np.random.uniform(5e-4, 5e-4, size=100)
-y = np.random.uniform(5e-4, 5e-4, size=100)
-t0 = time.time()
+    return ximg, Amat
+
+@njit
+def matrix_inverse(A):
+    B = np.zeros(A.shape)
+    B[0, 0] = A[1, 1]
+    B[1, 1] = A[0, 0]
+    B[0, 1] = -A[0, 1]
+    B[1, 0] = -A[1, 0]
+    return B / np.linalg.det(A)
+
+@njit
+def matmul_2d1d(A, B):
+    out = np.zeros(2)
+    out[0] = A[0, 0] * B[0] + A[0, 1] * B[1]
+    out[1] = A[1, 0] * B[0] + A[1, 1] * B[1]
+    return out
+
+#@njit
+def newton_raphson(initial_guess, xdis):
+    guess = np.array(initial_guess)
+    for i in range(10):
+        img_pos, mag = compute_img_position_and_mag(guess, xdis)
+        Jinv = matrix_inverse(mag[:, :, -1])
+        guess = guess - matmul_2d1d(Jinv, img_pos[:2, -1])
+
+    return guess
+
+img_pos, mag = compute_img_position_and_mag([0.0000,0.00000], xdis)
+print('mu = ', 1 / np.linalg.det(mag[:,:,-1]))
+
+x = np.linspace(-1e-3, 1e-3, 100)
+best = []
+best_r = -1
 for i in range(len(x)):
-    img_pos = compute_source_position([x[i],y[i]], xdis, N_screens=None)
+    for j in range(len(x)):
+        g = newton_raphson([x[i], x[j]], xdis)
+        img_pos, mag = compute_img_position_and_mag(g, xdis)
+        r = np.hypot(img_pos[0, -1], img_pos[1, -1])
+        if r < best_r or best_r == -1:
+            best = img_pos
+            best_r = r
+
+img_pos = best
+
+'''
+x = np.random.uniform(5e-6, 5e-6, size=100)
+y = np.random.uniform(5e-6, 5e-6, size=100)
+t0 = time.time()
+mus = []
+for i in range(len(x)):
+    img_pos, mag = compute_img_position_and_mag([x[i],y[i]], xdis, N_screens=None)
+    mus.append(1 / np.linalg.det(mag[:,:,-1]))
 
 t1 = time.time()
 tottime = (t1-t0)/len(x)
 print(f'avg time {tottime}')
+print(f'median mu = {np.std(mus)}')
+'''
 
 r = np.hypot(img_pos[0, :], img_pos[1, :])
 d = img_pos[2, :]
