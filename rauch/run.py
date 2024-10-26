@@ -8,6 +8,8 @@ from tqdm import tqdm
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 from matplotlib.ticker import MultipleLocator
 mpl.rcParams['figure.figsize'] = (8,6)
 mpl.rcParams['xtick.labelsize'] = 20
@@ -76,8 +78,8 @@ z = np.append(z, comoving_distance_from_redshift(z_source))
 
 # TEST USING JUST ONE SOURCE
 d_source = comoving_distance_from_redshift(1)
-x = np.array([0.0, 0.0])
-y = np.array([0.0, 0.0])
+x = np.array([5e-7, 0.0])
+y = np.array([5e-7, 0.0])
 z = np.array([d_source/2, d_source])
 
 # full vector of disruptors
@@ -153,6 +155,7 @@ def compute_img_position_and_mag(image_position, xdis, N_screens=None):
     ximg = np.zeros((3, N))
     Amat = np.zeros((2, 2, N))
     ximg[:, 0] = [image_position[0], image_position[1], xdis[2, 0]]
+    Amat[:, :, 0] = np.identity(2)
 
     # solve for all image positions, starting from the nearest plane to observer
     for ii in range(1, N):
@@ -188,55 +191,57 @@ def matmul_2d1d(A, B):
     out[1] = A[1, 0] * B[0] + A[1, 1] * B[1]
     return out
 
-#@njit
+@njit
 def newton_raphson(initial_guess, xdis):
     guess = np.array(initial_guess)
     r = 1
     i = 0
     # tolerance
-    while r > 1e-6:
+    while r > 5e-7:
         img_pos, mag = compute_img_position_and_mag(guess, xdis)
         Jinv = matrix_inverse(mag[:, :, -1])
         guess = guess - matmul_2d1d(Jinv, img_pos[:2, -1])
         r = np.hypot(img_pos[0, -1], img_pos[1, -1])
-        #print(abs(r - 4.03107e-5 * np.sqrt(2)))
 
         # don't let it go on for too long
         i += 1
         if i > 1e4:
             guess = np.array([np.nan, np.nan])
-            print('failed to converge')
             break
-
-    if not np.isnan(guess).any():
-        print('converged')
 
     return guess
 
 # this is good for an einstein ring
 r_einstein = 4.03107e-5 * np.sqrt(2)
 img_pos, mag = compute_img_position_and_mag([4.03107e-5,4.03107e-5], xdis)
-print(img_pos)
 print('mu = ', 1 / np.linalg.det(mag[:,:,-1]))
 
-x = np.linspace(-5e-5, 5e-5, 50)
-image_positions = []
-mus = []
-for i in tqdm(range(len(x))):
-    for j in range(len(x)):
-        g = newton_raphson([x[i], x[j]], xdis)
-        # only use converged g
-        if np.isnan(g).any():
-            img_pos = np.array([[np.nan, np.nan]]).T
-            mag = np.array([[[1,0],[0,1]]]).T
-        else:
-            img_pos, mag = compute_img_position_and_mag(g, xdis)
+@njit
+def grid_search(xdis):
+    n = 50
+    x = np.linspace(-7e-5, 7e-5, n)
+    image_positions = np.zeros((n**2, 2), dtype=np.float64)
+    mus = np.zeros(n**2, dtype=np.float64)
+    for i in range(len(x)):
+        print(f'{i} out of {n}')
+        for j in range(len(x)):
+            g = newton_raphson([x[i], x[j]], xdis)
+            # only use converged g
+            if np.isnan(g).any():
+                img_pos = np.array([[np.nan, np.nan]]).T
+                mag = np.identity(2)[:,:,np.newaxis]
+            else:
+                img_pos, mag = compute_img_position_and_mag(g, xdis)
 
-        image_positions.append(img_pos[:2, 0])
-        mus.append(1 / np.linalg.det(mag[:,:,-1]))
+            image_positions[n*i + j, :] = img_pos[:2, 0]
+            if np.linalg.det(mag[:,:,-1]) != 0:
+                mus[n*i + j] =  1 / np.linalg.det(mag[:,:,-1])
+            else:
+                mus[n*i + j] = -1
 
-image_positions = np.array(image_positions)
-mus = np.array(mus)
+    return image_positions, mus
+
+image_positions, mus = grid_search(xdis)
 
 
 '''
@@ -277,7 +282,17 @@ fig.savefig('images.pdf', bbox_inches='tight')
 fig, ax = plt.subplots()
 fig.set_size_inches(7, 7)
 
-ax.scatter(image_positions[:,0], image_positions[:,1], s=mus, color='black')
+cbar_loc = [0.9, 0.11, 0.04, 0.77]
+cmap = cm.get_cmap('cool')
+norm = mcolors.Normalize(vmin=min(mus), vmax=max(mus))
+sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+sm.set_array([])
+cbar_ax = fig.add_axes(cbar_loc)  # [left, bottom, width, height]
+cbar = plt.colorbar(sm, cax=cbar_ax, shrink=1)
+cbar_ax.set_ylabel(r'$\mu$')
+
+ax.scatter(image_positions[:,0], image_positions[:,1], s=1, color=cmap(norm(mus)))
+print(mus)
 
 ax.set_xlabel(r'comoving transverse x [Mpc]')
 ax.set_ylabel(r'comoving transverse y [Mpc]')
