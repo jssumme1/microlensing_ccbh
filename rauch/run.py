@@ -1,11 +1,10 @@
 import numpy as np
-#from colossus.cosmology import cosmology
-#cosmo = cosmology.setCosmology('planck18')
 from astropy.cosmology import Planck18 as cosmo
 import astropy.units as u
 import astropy.constants as c
 from numba import njit
 import time
+from tqdm import tqdm
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -69,6 +68,17 @@ theta = 2 * np.pi * np.random.uniform(size=N_disruptors)
 x = radii * np.cos(theta)
 y = radii * np.sin(theta)
 z = distances
+
+# add the source plane
+x = np.append(x, 0)
+y = np.append(y, 0)
+z = np.append(z, comoving_distance_from_redshift(z_source))
+
+# TEST USING JUST ONE SOURCE
+d_source = comoving_distance_from_redshift(1)
+x = np.array([0.0, 0.0])
+y = np.array([0.0, 0.0])
+z = np.array([d_source/2, d_source])
 
 # full vector of disruptors
 xdis = np.array([x, y, z])
@@ -181,29 +191,53 @@ def matmul_2d1d(A, B):
 #@njit
 def newton_raphson(initial_guess, xdis):
     guess = np.array(initial_guess)
-    for i in range(10):
+    r = 1
+    i = 0
+    # tolerance
+    while r > 1e-6:
         img_pos, mag = compute_img_position_and_mag(guess, xdis)
         Jinv = matrix_inverse(mag[:, :, -1])
         guess = guess - matmul_2d1d(Jinv, img_pos[:2, -1])
+        r = np.hypot(img_pos[0, -1], img_pos[1, -1])
+        #print(abs(r - 4.03107e-5 * np.sqrt(2)))
+
+        # don't let it go on for too long
+        i += 1
+        if i > 1e4:
+            guess = np.array([np.nan, np.nan])
+            print('failed to converge')
+            break
+
+    if not np.isnan(guess).any():
+        print('converged')
 
     return guess
 
-img_pos, mag = compute_img_position_and_mag([0.0000,0.00000], xdis)
+# this is good for an einstein ring
+r_einstein = 4.03107e-5 * np.sqrt(2)
+img_pos, mag = compute_img_position_and_mag([4.03107e-5,4.03107e-5], xdis)
+print(img_pos)
 print('mu = ', 1 / np.linalg.det(mag[:,:,-1]))
 
-x = np.linspace(-1e-3, 1e-3, 100)
-best = []
-best_r = -1
-for i in range(len(x)):
+x = np.linspace(-5e-5, 5e-5, 50)
+image_positions = []
+mus = []
+for i in tqdm(range(len(x))):
     for j in range(len(x)):
         g = newton_raphson([x[i], x[j]], xdis)
-        img_pos, mag = compute_img_position_and_mag(g, xdis)
-        r = np.hypot(img_pos[0, -1], img_pos[1, -1])
-        if r < best_r or best_r == -1:
-            best = img_pos
-            best_r = r
+        # only use converged g
+        if np.isnan(g).any():
+            img_pos = np.array([[np.nan, np.nan]]).T
+            mag = np.array([[[1,0],[0,1]]]).T
+        else:
+            img_pos, mag = compute_img_position_and_mag(g, xdis)
 
-img_pos = best
+        image_positions.append(img_pos[:2, 0])
+        mus.append(1 / np.linalg.det(mag[:,:,-1]))
+
+image_positions = np.array(image_positions)
+mus = np.array(mus)
+
 
 '''
 x = np.random.uniform(5e-6, 5e-6, size=100)
@@ -220,6 +254,7 @@ print(f'avg time {tottime}')
 print(f'median mu = {np.std(mus)}')
 '''
 
+'''
 r = np.hypot(img_pos[0, :], img_pos[1, :])
 d = img_pos[2, :]
 
@@ -237,3 +272,19 @@ ax.tick_params(axis='both', which='minor', direction='in',
                     bottom=True, top=True, left=True, right=True)
 
 fig.savefig('images.pdf', bbox_inches='tight')
+'''
+
+fig, ax = plt.subplots()
+fig.set_size_inches(7, 7)
+
+ax.scatter(image_positions[:,0], image_positions[:,1], s=mus, color='black')
+
+ax.set_xlabel(r'comoving transverse x [Mpc]')
+ax.set_ylabel(r'comoving transverse y [Mpc]')
+
+ax.tick_params(axis='both', which='major', direction='in', 
+                    bottom=True, top=True, left=True, right=True)
+ax.tick_params(axis='both', which='minor', direction='in', 
+                    bottom=True, top=True, left=True, right=True)
+
+fig.savefig('einstein_image.pdf', bbox_inches='tight')
